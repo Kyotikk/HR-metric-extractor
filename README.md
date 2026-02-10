@@ -32,6 +32,7 @@ Key fields in `config.yaml`:
 - `data.ecg_path` - ECG/PPG/HR signal CSV (or folder of CSV.GZ)
 - `signal.signal_type` - `ecg`, `ppg`, or `hr`
 - `activities.*` - keywords and minimum durations
+- `activities.extra` - custom activities (e.g., `washing_hands`) to extract and compute metrics
 
 You can also generate a template via:
 

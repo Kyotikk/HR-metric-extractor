@@ -97,8 +97,8 @@ def create_default_config() -> dict:
             'output_dir': './output',
         },
         'data': {
-            'adl_path': '/path/to/ADLs.csv.gz',  # Path to ADL CSV
-            'ecg_path': '/path/to/ecg.csv.gz',  # Path to ECG/PPG CSV
+            'adl_path': 'D:/ETHZ/Lifelogging/interim/scai-ncgg/sim_elderly_2/scai_app/ADLs_1.csv.gz',  # Path to ADL CSV
+            'ecg_path': 'D:/ETHZ/Lifelogging/interim/scai-ncgg/sim_elderly_2/vivalnk_vv330_ecg/data_1.csv.gz',  # Path to PPG CSV
             'hr_metrics_path': None,  # Path to pre-computed HR metrics (optional)
         },
         'activities': {
@@ -282,7 +282,7 @@ def run_inspection_pipeline(config_path: str) -> None:
     resting_raw = resting.copy()
     
     if time_offset_sec is None or time_offset_sec == 'auto':
-        # Auto-estimate offset: align ADL activities to ECG segments
+        # Auto-estimate offset: align ADL activities to ECG segments based on ADL start time and ECG recording times
         if len(adl_intervals) > 0 and len(ecg_data) > 0:
             adl_min = adl_intervals['t_start'].min()
             ecg_min = ecg_data['t_sec'].min()
@@ -781,6 +781,28 @@ def run_inspection_pipeline(config_path: str) -> None:
         summary['resting_mean_hr'] = resting_metrics_df['mean_hr'].mean()
         summary['resting_mean_rmssd'] = resting_metrics_df['rmssd'].mean()
         summary['resting_mean_stress_index'] = resting_metrics_df['stress_index'].mean()
+
+    # Add custom activity summaries
+    if custom_activities:
+        custom_total_count = 0
+        custom_total_with_metrics = 0
+        for name, activities_df in custom_activities.items():
+            safe_name = str(name).strip().lower().replace(' ', '_')
+            metrics_df = custom_metrics_dfs.get(name, pd.DataFrame())
+
+            summary[f'custom_{safe_name}_count'] = len(activities_df)
+            summary[f'custom_{safe_name}_with_metrics'] = len(metrics_df)
+
+            if len(metrics_df) > 0:
+                summary[f'custom_{safe_name}_mean_hr'] = metrics_df['mean_hr'].mean()
+                summary[f'custom_{safe_name}_mean_rmssd'] = metrics_df['rmssd'].mean()
+                summary[f'custom_{safe_name}_mean_stress_index'] = metrics_df['stress_index'].mean()
+
+            custom_total_count += len(activities_df)
+            custom_total_with_metrics += len(metrics_df)
+
+        summary['custom_total_count'] = custom_total_count
+        summary['custom_total_with_metrics'] = custom_total_with_metrics
     
     # Save summary
     summary_df = pd.DataFrame([summary])

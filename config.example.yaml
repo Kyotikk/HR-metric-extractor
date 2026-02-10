@@ -33,6 +33,15 @@ activities:
   min_duration_sec: 30.0
   baseline_min_duration_sec: 35.0
 
+  # Extra activity categories (optional)
+  extra:
+    washing_hands:
+      keywords:
+        - wash hands
+        - washing hands
+        - hand wash
+      min_duration_sec: 15.0
+
 signal:
   # Signal type: one of [ppg, ecg, hr]
   signal_type: ecg
