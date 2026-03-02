@@ -9,7 +9,7 @@ Supports PPG, ECG, HR, and ADL (Activities of Daily Living) data.
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional, Dict, List
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -265,6 +265,308 @@ def create_data_summary(data_df: pd.DataFrame,
     summary['estimated_fs_hz'] = estimate_sampling_frequency(data_df[time_col].values)
     
     return summary
+
+
+def _normalize_imu_columns(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """Normalize common IMU column names to a standard schema.
+
+    Returns DataFrame with columns [t_sec, imu_x, imu_y, imu_z, imu_magnitude]
+    or None if no valid IMU columns are found.
+    """
+    if df is None or len(df) == 0:
+        return None
+
+    work_df = df.copy()
+    work_df.columns = [c.strip().lower() for c in work_df.columns]
+
+    # Time column detection
+    time_col = None
+    for col in ['t_sec', 'time', 'timestamp', 't', 'time_sec']:
+        if col in work_df.columns:
+            time_col = col
+            break
+
+    if time_col is None:
+        return None
+
+    axis_candidates = {
+        'imu_x': ['accX', 'imu_x', 'x', 'acc_x', 'ax', 'accel_x', 'accelerometer_x', 'gyro_x', 'gyr_x'],
+        'imu_y': ['accY', 'imu_y', 'y', 'acc_y', 'ay', 'accel_y', 'accelerometer_y', 'gyro_y', 'gyr_y'],
+        'imu_z': ['accZ', 'imu_z', 'z', 'acc_z', 'az', 'accel_z', 'accelerometer_z', 'gyro_z', 'gyr_z'],
+    }
+
+    selected_cols = {'t_sec': time_col}
+    for target_col, options in axis_candidates.items():
+        for option in options:
+            if option in work_df.columns and option != time_col:
+                selected_cols[target_col] = option
+                break
+
+    # Fallback: if axes not found, use up to 3 numeric columns after time
+    if len(selected_cols) == 1:
+        numeric_cols = work_df.select_dtypes(include=[np.number]).columns.tolist()
+        numeric_cols = [c for c in numeric_cols if c != time_col]
+        for idx, col_name in enumerate(numeric_cols[:3]):
+            selected_cols[f'imu_{"xyz"[idx]}'] = col_name
+
+    if len(selected_cols) == 1:
+        return None
+
+    out_cols = [selected_cols['t_sec']]
+    for axis in ['imu_x', 'imu_y', 'imu_z']:
+        if axis in selected_cols:
+            out_cols.append(selected_cols[axis])
+
+    result = work_df[out_cols].copy()
+    rename_map = {selected_cols['t_sec']: 't_sec'}
+    for axis in ['imu_x', 'imu_y', 'imu_z']:
+        if axis in selected_cols:
+            rename_map[selected_cols[axis]] = axis
+
+    result = result.rename(columns=rename_map)
+
+    result['t_sec'] = pd.to_numeric(result['t_sec'], errors='coerce')
+    for axis in ['imu_x', 'imu_y', 'imu_z']:
+        if axis in result.columns:
+            result[axis] = pd.to_numeric(result[axis], errors='coerce')
+
+    # Ensure all axis columns exist (NaN when unavailable)
+    for axis in ['imu_x', 'imu_y', 'imu_z']:
+        if axis not in result.columns:
+            result[axis] = np.nan
+
+    result = result.dropna(subset=['t_sec'])
+    if len(result) == 0:
+        return None
+
+    result['imu_magnitude'] = np.sqrt(
+        result['imu_x'].fillna(0.0) ** 2 +
+        result['imu_y'].fillna(0.0) ** 2 +
+        result['imu_z'].fillna(0.0) ** 2
+    )
+
+    result = result.sort_values('t_sec').reset_index(drop=True)
+    return result
+
+
+def _discover_imu_sensors(subject_path: Path) -> Dict[str, List[Path]]:
+    """Discover IMU sensor directories and files organized by sensor type.
+    
+    Looks for patterns like:
+    - corsano_bioz_acc/ (contains date folders with CSV files)
+    - corsano_wrist_acc/ (contains date folders with CSV files)
+    - vivalnk_vv330_acceleration/ (contains CSV files directly)
+    
+    Returns a dict mapping sensor_name -> list of candidate file/folder paths.
+    """
+    if subject_path is None or not Path(subject_path).exists():
+        return {}
+    
+    subject_path = Path(subject_path)
+    sensor_map: Dict[str, List[Path]] = {}
+    
+    # Known sensor folder patterns
+    imu_sensor_patterns = [
+        'corsano_bioz_acc',
+        'corsano_wrist_acc',
+        'vivalnk_vv330_acceleration',
+        'vivalnk_vv330_accel',
+        # 'imu',
+    ]
+    
+    for folder in subject_path.iterdir():
+        if not folder.is_dir():
+            continue
+        
+        folder_name = folder.name.lower()
+        
+        # Check if folder matches any known sensor pattern
+        matched_sensor = None
+        for pattern in imu_sensor_patterns:
+            if pattern in folder_name:
+                matched_sensor = folder.name  # Use actual folder name (preserves case)
+                break
+        
+        if matched_sensor is None:
+            continue
+        
+        # Collect all CSV files within this sensor directory (recursively for date folders)
+        csv_files = list(folder.glob('**/*.csv.gz')) + list(folder.glob('**/*.csv'))
+        if csv_files:
+            sensor_map[matched_sensor] = sorted(csv_files)
+    
+    return sensor_map
+
+
+def load_imu_sensors(subject_path: Path,
+                     imu_config: Optional[Dict[str, str]] = None) -> Dict[str, pd.DataFrame]:
+    """Load multiple IMU sensor streams as separate DataFrames.
+    
+    Discovers IMU sensors in subject directory or uses explicit config paths.
+    Each sensor is kept separate to preserve independent time synchronization
+    and signal characteristics.
+    
+    Args:
+        subject_path: Path to subject directory for auto-discovery
+        imu_config: Optional dict mapping sensor_name -> sensor_path
+                   (e.g., {'corsano_bioz_acc': '/path/to/corsano_bioz_acc'})
+    
+    Returns:
+        Dict mapping sensor_name -> DataFrame with columns [t_sec, imu_x, imu_y, imu_z, imu_magnitude]
+        Sensors with no/invalid data are omitted from the dict.
+    """
+    result_sensors: Dict[str, pd.DataFrame] = {}
+    
+    if imu_config is None:
+        imu_config = {}
+    
+    # First, try to load sensors from explicit config paths
+    for sensor_name, sensor_path in imu_config.items():
+        if sensor_path is None:
+            continue
+        
+        sensor_path = Path(sensor_path)
+        candidate_files: List[Path] = []
+        
+        if sensor_path.is_file():
+            candidate_files = [sensor_path]
+        elif sensor_path.is_dir():
+            candidate_files = sorted(list(sensor_path.glob('**/*.csv.gz')) + list(sensor_path.glob('**/*.csv')))
+        
+        if not candidate_files:
+            continue
+        
+        # Merge all files for this sensor
+        frames = []
+        for file_path in candidate_files:
+            try:
+                compression = 'gzip' if str(file_path).lower().endswith('.gz') else None
+                raw_df = pd.read_csv(file_path, compression=compression)
+                imu_df = _normalize_imu_columns(raw_df)
+                if imu_df is not None and len(imu_df) > 0:
+                    frames.append(imu_df)
+            except Exception:
+                continue
+        
+        if frames:
+            sensor_df = pd.concat(frames, ignore_index=True)
+            sensor_df = sensor_df.sort_values('t_sec').reset_index(drop=True)
+            result_sensors[sensor_name] = sensor_df
+    
+    # Second, auto-discover sensors in subject_path (if not already in config)
+    auto_sensors = _discover_imu_sensors(subject_path)
+    for sensor_name, candidate_files in auto_sensors.items():
+        if sensor_name in result_sensors:
+            continue  # Already loaded from config
+        
+        frames = []
+        for file_path in candidate_files:
+            try:
+                compression = 'gzip' if str(file_path).lower().endswith('.gz') else None
+                raw_df = pd.read_csv(file_path, compression=compression)
+                imu_df = _normalize_imu_columns(raw_df)
+                if imu_df is not None and len(imu_df) > 0:
+                    frames.append(imu_df)
+            except Exception:
+                continue
+        
+        if frames:
+            sensor_df = pd.concat(frames, ignore_index=True)
+            sensor_df = sensor_df.sort_values('t_sec').reset_index(drop=True)
+            result_sensors[sensor_name] = sensor_df
+    
+    return result_sensors
+
+
+def load_eda_bioz_data(subject_path: Path,
+                       eda_bioz_path: Optional[Path] = None) -> Optional[pd.DataFrame]:
+    """Load EDA/BioZ data from corsano_bioz_bioz sensor.
+    
+    Searches for corsano_bioz_bioz directory with date subfolders containing CSV files.
+    All files are merged into a single DataFrame.
+    
+    Args:
+        subject_path: Path to subject directory for auto-discovery
+        eda_bioz_path: Optional explicit path to corsano_bioz_bioz folder or specific file
+        
+    Returns:
+        DataFrame with columns [t_sec, eda_bioz] or None if not found
+    """
+    candidate_files: List[Path] = []
+    
+    # If explicit path provided, use it
+    if eda_bioz_path is not None:
+        eda_bioz_path = Path(eda_bioz_path)
+        if eda_bioz_path.is_file():
+            candidate_files = [eda_bioz_path]
+        elif eda_bioz_path.is_dir():
+            # Recursively find CSV files in date folders
+            candidate_files = sorted(list(eda_bioz_path.glob('**/*.csv.gz')) + list(eda_bioz_path.glob('**/*.csv')))
+    elif subject_path is not None:
+        # Auto-discover corsano_bioz_bioz folder
+        subject_path = Path(subject_path)
+        bioz_dir = subject_path / 'corsano_bioz_bioz'
+        if bioz_dir.exists():
+            candidate_files = sorted(list(bioz_dir.glob('**/*.csv.gz')) + list(bioz_dir.glob('**/*.csv')))
+    
+    if not candidate_files:
+        return None
+    
+    frames = []
+    for file_path in candidate_files:
+        try:
+            compression = 'gzip' if str(file_path).lower().endswith('.gz') else None
+            df = pd.read_csv(file_path, compression=compression)
+            
+            # Normalize column names
+            df.columns = [c.strip().lower() for c in df.columns]
+            
+            # Find time column
+            time_col = None
+            for col in ['t_sec', 'time', 'timestamp', 't', 'time_sec']:
+                if col in df.columns:
+                    time_col = col
+                    break
+            
+            if time_col is None:
+                continue
+            
+            # Find signal column (BioZ/EDA typically single-valued)
+            signal_col = None
+            for col in ['value', 'bioz', 'eda', 'bioimpedance', 'impedance', 'conductance', 'gsr']:
+                if col in df.columns:
+                    signal_col = col
+                    break
+            
+            # Fallback: use first numeric column after time
+            if signal_col is None:
+                numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+                numeric_cols = [c for c in numeric_cols if c != time_col]
+                if numeric_cols:
+                    signal_col = numeric_cols[0]
+                else:
+                    continue
+            
+            # Extract, rename, and clean
+            result = df[[time_col, signal_col]].copy()
+            result.columns = ['t_sec', 'eda_bioz']
+            
+            result['t_sec'] = pd.to_numeric(result['t_sec'], errors='coerce')
+            result['eda_bioz'] = pd.to_numeric(result['eda_bioz'], errors='coerce')
+            result = result.dropna()
+            result = result.sort_values('t_sec').reset_index(drop=True)
+            
+            if len(result) > 0:
+                frames.append(result)
+        except Exception:
+            continue
+    
+    if not frames:
+        return None
+    
+    result = pd.concat(frames, ignore_index=True)
+    result = result.sort_values('t_sec').reset_index(drop=True)
+    return result if len(result) > 0 else None
 
 
 def load_ppg_data(subject_path: Path, channel: str = 'green') -> Optional[pd.DataFrame]:

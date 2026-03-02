@@ -7,7 +7,6 @@ extracting HR metrics and generating comparative analysis.
 """
 
 import logging
-import os
 import yaml
 import pandas as pd
 from pathlib import Path
@@ -24,12 +23,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Data paths
-DATA_BASE_PATH = Path(os.environ.get('DATA_BASE_PATH', './data'))
+DATA_BASE_PATH = Path(r'D:\ETHZ\Lifelogging\interim_server')
 SUBJECTS = [
-    'sim_elderly_1', 'sim_elderly_2', 'sim_elderly_3', 'sim_elderly_4', 'sim_elderly_5',
-    'sim_healthy_1', 'sim_healthy_2', 'sim_healthy_3', 'sim_healthy_4', 'sim_healthy_5',
-    'sim_severe_1', 'sim_severe_2', 'sim_severe_3', 'sim_severe_4', 'sim_severe_5',
-    'sub_0103', 'sub_0301', 'sub_0301_2', 'sub_0302', 'sub_0303', 'sub_0304', 'sub_0305'
+    # 'sim_elderly_1', 'sim_elderly_2', 'sim_elderly_3', 'sim_elderly_4', 'sim_elderly_5',
+    # 'sim_healthy_1', 'sim_healthy_2', 'sim_healthy_3', 'sim_healthy_4', 'sim_healthy_5',
+    # 'sim_severe_1', 'sim_severe_2', 'sim_severe_3', 'sim_severe_4', 'sim_severe_5',
+    'sub_0103', 'sub_0301', 'sub_0301_2', 'sub_0302', 'sub_0303', 'sub_0304', 'sub_0305',
+    'sub_SS', 'sub_S1', 'sub_OE', 'sub_N05', 'sub_N04', 'sub_MI2', 'sub_M1', 'sub_IM', 
+    'sub_F', 'sub_EI', 'sub_B4', 'sub_B3', 'sub_B2', 'sub_B1', 'sub_A3', 'sub_A2', 'sub_A1'
 ]
 
 
@@ -50,16 +51,39 @@ def check_subject_data(subject_id: str) -> dict:
     adl_time_max = None
     
     # Check for ADL data in scai_app (primary location)
-    scai_app_path = subject_path / 'scai_app' / 'ADLs_1.csv.gz'
+    scai_app_path = subject_path / 'scai_app'
+    adl_file = None
     if scai_app_path.exists():
-        adl_path = str(scai_app_path)
+        # Keep filename matching lenient but ensure a file path is selected.
+        for pattern in ('*ADL*', '*adl*'):
+            for file in scai_app_path.glob(pattern):
+                if file.is_file():
+                    adl_file = file
+                    break
+            if adl_file is not None:
+                break
+
+        # Fallback: use any CSV/CSV.GZ file if no ADL-named file was found.
+        if adl_file is None:
+            for pattern in ('*.csv.gz', '*.csv'):
+                candidate = next((f for f in scai_app_path.glob(pattern) if f.is_file()), None)
+                if candidate is not None:
+                    adl_file = candidate
+                    break
+
+    if adl_file is not None:
+        adl_path = str(adl_file)
         has_adl = True
 
     # If ADL exists, load time range to select the best matching ECG file
     if has_adl and adl_path is not None:
         try:
-            with gzip.open(adl_path, 'rt', encoding='utf-8', errors='ignore') as f:
-                adl_df = pd.read_csv(f)
+            adl_file_path = Path(adl_path)
+            if adl_file_path.suffix == '.gz':
+                with gzip.open(adl_file_path, 'rt', encoding='utf-8', errors='ignore') as f:
+                    adl_df = pd.read_csv(f)
+            else:
+                adl_df = pd.read_csv(adl_file_path)
             adl_df.columns = [c.strip().lower() for c in adl_df.columns]
 
             if 'time' in adl_df.columns:
@@ -81,8 +105,11 @@ def check_subject_data(subject_id: str) -> dict:
     # Check for ECG data - could be in root or in a date subfolder
     if ecg_dir.exists():
         # Try direct path first (simulated subjects)
-        direct_ecg = ecg_dir / 'data_1.csv.gz'
-        if direct_ecg.exists():
+        direct_ecg = next(ecg_dir.glob('data_*.csv.gz'), None)
+        if direct_ecg is None:
+            direct_ecg = next(ecg_dir.glob('*.csv.gz'), None)
+
+        if direct_ecg is not None and direct_ecg.exists():
             ecg_path = str(direct_ecg)
             has_ecg = True
         else:
@@ -136,15 +163,50 @@ def create_subject_config(subject_id: str, output_dir: Path, data_check: dict) -
             'hr_metrics_path': None
         },
         'activities': {
-            'time_offset_sec': None,  # Auto-estimate
+            'time_offset_sec': None,  # Auto-estimate / kinda not working well
+            # d4500 Walking short distances
             'propulsion_keywords': ['level walking', 'walking', 'walker', 'self propulsion', 'propulsion', 'assisted propulsion'],
+            # d4150 Maintaining a lying position
             'resting_keywords': ['sitting', 'rest', 'lying'],
             'min_duration_sec': 30.0,
             'baseline_min_duration_sec': 35.0,
             # additional activities - iterate through entire SENSEI protocol?
             'extra': {
+                # Basic Mobility:
+                # d4154 Maintaining a standing position
+                'standing': {
+                    'keywords': ['stand'],
+                    'min_duration_sec': 10.0
+                },
+                # d4200 Transferring oneself while sitting
+                'transfer': {
+                    'keywords': ['transfer to bed', 'transfer from bed', 'sit to stand', 'stand to sit', 'Sit to Lying', 'bed transfer'],
+                    'min_duration_sec': 3.0
+                },
+                # d4201 Transferring oneself while lying
+                'bed_transfer': {
+                    'keywords': ['Turn Over (right)', 'Turn Over (left)', 'Lying to Sit'],
+                    'min_duration_sec': 10.0
+                },
+                # Self-care: Grooming, washing hands, washing face, dental care, hair care
+                # d5100 Washing body parts
                 'washing_hands': {
                     'keywords': ['wash hands', 'washing hands', 'hand wash'],
+                    'min_duration_sec': 10.0
+                },
+                # d5100 Washing body parts
+                'washing_face': {
+                    'keywords': ['wash face', 'washing face', 'face wash'],
+                    'min_duration_sec': 10.0
+                },
+                # d5201 Caring for teeth
+                'dental_care': {
+                    'keywords': ['put toothpaste', 'brush teeth', 'rinse mouth'],
+                    'min_duration_sec': 8.0
+                },
+                # d5202 Caring for hair
+                'hair_care': {
+                    'keywords': ['Style Beard/Hair'],
                     'min_duration_sec': 15.0
                 }
             }
@@ -160,8 +222,17 @@ def create_subject_config(subject_id: str, output_dir: Path, data_check: dict) -
             'max_delay_sec': 300.0,
             'recovery_window_sec': 300.0,
             'baseline_window_sec': 120.0
+        },
+        'visualization': {
+            'enable_overlays': True,
+            'activities': ['propulsion', 'resting', 'washing_hands'],
+            'margin_sec': 30.0,
+            'max_windows_per_activity': 5,
+            'relative_time': True,
+            'output_dir': 'overlays'
         }
     }
+    # TMUX, Byobu, terminal multiplexer
     
     # Save to batch directory (not subject-specific directory which may not exist yet)
     config_path = output_dir / f'config_{subject_id}.yaml'
@@ -208,7 +279,7 @@ def process_subject(subject_id: str, batch_output_dir: Path) -> dict:
             cwd=Path.cwd(),
             capture_output=True,
             text=True,
-            timeout=300  # 5 minute timeout
+            timeout=600  # 10 minute timeout
         )
         
         if result.returncode == 0:

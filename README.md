@@ -30,6 +30,8 @@ python run_inspection.py --config config.yaml
 Key fields in `config.yaml`:
 - `data.adl_path` - ADL CSV with start/end events
 - `data.ecg_path` - ECG/PPG/HR signal CSV (or folder of CSV.GZ)
+- `data.imu_paths` - optional dict mapping sensor_name -> path (if omitted, pipeline auto-discovers IMU sensors in subject folder)
+- `data.eda_bioz_path` - optional corsano_bioz_bioz file/folder path (if omitted, pipeline auto-discovers in subject folder)
 - `signal.signal_type` - `ecg`, `ppg`, or `hr`
 - `activities.*` - keywords and minimum durations
 - `activities.extra` - custom activities (e.g., `washing_hands`) to extract and compute metrics

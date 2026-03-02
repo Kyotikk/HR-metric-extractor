@@ -7,6 +7,9 @@ project:
 data:
   adl_path: /path/to/ADLs.csv.gz
   ecg_path: /path/to/ecg.csv.gz
+  imu_paths: null  # Optional: dict mapping sensor_name -> path, or null for auto-discovery
+                   # Example: {corsano_bioz_acc: /path/to/corsano_bioz_acc, corsano_wrist_acc: /path/to/corsano_wrist_acc}
+  eda_bioz_path: null  # Optional: corsano_bioz_bioz path or file (auto-discovery if null)
   hr_metrics_path: null  # Optional: set to path if pre-computed
 
 activities:
@@ -66,3 +69,25 @@ analysis:
   max_delay_sec: 300.0
   recovery_window_sec: 300.0
   baseline_window_sec: 120.0
+
+visualization:
+  # Generate HR overlay plots during the pipeline run
+  enable_overlays: false
+
+  # Activities to visualize (use safe names for custom activities)
+  activities:
+    - propulsion
+    - resting
+    - washing_hands
+
+  # Padding around each activity window (seconds)
+  margin_sec: 30.0
+
+  # Limit plots per activity type (null for all)
+  max_windows_per_activity: 5
+
+  # Plot time relative to activity start
+  relative_time: true
+
+  # Relative or absolute output directory (relative -> output_dir)
+  output_dir: overlays

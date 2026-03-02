@@ -59,7 +59,7 @@ def extract_propulsion_activities(adl_intervals: pd.DataFrame, min_duration_sec:
 
 def extract_resting_activities(adl_intervals: pd.DataFrame, min_duration_sec: float = 60.0, keywords: list = None) -> pd.DataFrame:
     if keywords is None:
-        keywords = ['sitting','rest','lying','seated']
+        keywords = ['sitting','rest','lying']
     mask = adl_intervals['activity'].str.lower().apply(lambda x: any(kw in x for kw in keywords))
     out = adl_intervals[mask].copy()
     out = out[out['duration_sec'] >= min_duration_sec].reset_index(drop=True)

@@ -27,6 +27,11 @@ from hr_metrics import (
     compute_differential_metrics, extract_hr_metrics_from_timeseries,
     check_signal_quality
 )
+from feature_extraction import (
+    extract_activity_hrv_features, extract_activity_eda_features,
+    extract_activity_ppg_features, extract_activity_imu_features,
+    merge_feature_dicts
+)
 from window_overlap_analysis import (
     segment_activity_into_phases, extract_phases_from_data,
     compute_optimal_windows_for_metrics, create_window_overlap_report
@@ -34,7 +39,7 @@ from window_overlap_analysis import (
 from data_loading import (
     load_timeseries_data, load_hr_metrics, extract_window_data,
     estimate_sampling_frequency, create_data_summary,
-    load_ppg_data
+    load_ppg_data, load_imu_sensors, load_eda_bioz_data
 )
 
 
@@ -99,6 +104,8 @@ def create_default_config() -> dict:
         'data': {
             'adl_path': 'D:/ETHZ/Lifelogging/interim/scai-ncgg/sim_elderly_2/scai_app/ADLs_1.csv.gz',  # Path to ADL CSV
             'ecg_path': 'D:/ETHZ/Lifelogging/interim/scai-ncgg/sim_elderly_2/vivalnk_vv330_ecg/data_1.csv.gz',  # Path to PPG CSV
+            'imu_paths': None,  # Optional: dict mapping sensor_name -> path, or null for auto-discovery
+            'eda_bioz_path': None,  # Optional: corsano_bioz_bioz path or file (auto-discovery if null)
             'hr_metrics_path': None,  # Path to pre-computed HR metrics (optional)
         },
         'activities': {
@@ -125,8 +132,60 @@ def create_default_config() -> dict:
             'max_delay_sec': 300.0,
             'recovery_window_sec': 300.0,
             'baseline_window_sec': 120.0,
+        },
+        'visualization': {
+            'enable_overlays': False,
+            'activities': ['propulsion', 'resting', 'washing_hands'],
+            'margin_sec': 30.0,
+            'max_windows_per_activity': 5,
+            'relative_time': True,
+            'output_dir': 'overlays'
         }
     }
+
+
+def _plot_overlay_window(window: dict,
+                         ecg_data: pd.DataFrame,
+                         output_dir: Path,
+                         subject_label: str,
+                         margin_sec: float,
+                         fs: float | None,
+                         relative_time: bool) -> bool:
+    try:
+        from visualize_hr_overlays import plot_window_hr
+    except Exception as exc:
+        logger.warning(f"  Overlay plot import failed: {exc}")
+        return False
+
+    if ecg_data is None or len(ecg_data) == 0:
+        return False
+
+    signal, time = extract_window_data(
+        ecg_data,
+        window['t_start'],
+        window['t_end'],
+        margin_sec=margin_sec
+    )
+
+    if len(signal) == 0:
+        return False
+
+    data = pd.DataFrame({'t_sec': time, 'value': signal})
+    try:
+        plot_window_hr(
+            window,
+            data,
+            output_dir,
+            subject_label,
+            margin_sec,
+            fs,
+            relative_time=relative_time
+        )
+    except Exception as exc:
+        logger.warning(f"  Overlay plot failed for {window.get('activity', 'unknown')}: {exc}")
+        return False
+
+    return True
 
 
 def run_inspection_pipeline(config_path: str) -> None:
@@ -147,6 +206,29 @@ def run_inspection_pipeline(config_path: str) -> None:
     output_dir = Path(cfg['project']['output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Output directory: {output_dir}")
+
+    viz_cfg = cfg.get('visualization', {}) or {}
+    viz_enabled = bool(viz_cfg.get('enable_overlays', False))
+    viz_activities = viz_cfg.get('activities', ['propulsion', 'resting'])
+    if isinstance(viz_activities, str):
+        viz_activities = [a.strip() for a in viz_activities.split(',') if a.strip()]
+    viz_margin_sec = float(viz_cfg.get('margin_sec', 30.0))
+    viz_relative_time = bool(viz_cfg.get('relative_time', True))
+    viz_max_windows = viz_cfg.get('max_windows_per_activity', None)
+    if viz_max_windows is not None:
+        try:
+            viz_max_windows = int(viz_max_windows)
+        except Exception:
+            viz_max_windows = None
+    if viz_max_windows is not None and viz_max_windows <= 0:
+        viz_max_windows = None
+
+    viz_output_dir = Path(viz_cfg.get('output_dir', 'overlays'))
+    if not viz_output_dir.is_absolute():
+        viz_output_dir = output_dir / viz_output_dir
+
+    subject_label = cfg.get('project', {}).get('subject_id') or output_dir.name
+    viz_counts = {str(a): 0 for a in viz_activities}
     
     # ========================================================================
     # STEP 1: Load and parse ADL data
@@ -260,6 +342,53 @@ def run_inspection_pipeline(config_path: str) -> None:
     
     logger.info(f"  Signal source: {signal_source}")
     logger.info(f"  Sensor quality scores: {sensor_quality}")
+
+    # Load IMU data (multiple sensors, each kept separate)
+    imu_sensors = {}  # Dict mapping sensor_name -> DataFrame
+    try:
+        imu_cfg_paths = cfg.get('data', {}).get('imu_paths', None)
+        if imu_cfg_paths is None:
+            imu_cfg_paths = {}
+        elif isinstance(imu_cfg_paths, str):
+            # Support legacy single-path config by wrapping in dict
+            imu_cfg_paths = {'imu': imu_cfg_paths}
+        
+        imu_sensors = load_imu_sensors(subject_path=subject_path, imu_config=imu_cfg_paths)
+        
+        if len(imu_sensors) > 0:
+            logger.info(f"  IMU sensors loaded: {len(imu_sensors)} sensor(s)")
+            for sensor_name, sensor_df in imu_sensors.items():
+                duration_sec = sensor_df['t_sec'].max() - sensor_df['t_sec'].min()
+                n_samples = len(sensor_df)
+                logger.info(f"    - {sensor_name}: {n_samples} samples, duration={duration_sec:.1f}s")
+        else:
+            logger.info("  IMU data not found (skipping IMU for this run)")
+    except Exception as e:
+        logger.warning(f"  Failed to load IMU data: {str(e)}")
+        imu_sensors = {}
+
+    # Load EDA/BioZ data (corsano_bioz_bioz sensor)
+    eda_bioz_data = None
+    eda_bioz_summary = None
+    try:
+        eda_bioz_cfg_path = cfg.get('data', {}).get('eda_bioz_path')
+        eda_bioz_data = load_eda_bioz_data(subject_path=subject_path, eda_bioz_path=eda_bioz_cfg_path)
+        
+        if eda_bioz_data is not None and len(eda_bioz_data) > 0:
+            eda_bioz_summary = create_data_summary(eda_bioz_data, time_col='t_sec', signal_col='eda_bioz')
+            logger.info(
+                f"  EDA/BioZ loaded: {len(eda_bioz_data)} samples, "
+                f"duration={eda_bioz_summary['duration_sec']:.1f}s, "
+                f"estimated_fs={eda_bioz_summary['estimated_fs_hz']:.2f}Hz"
+            )
+        else:
+            logger.info("  EDA/BioZ data not found (skipping for this run)")
+            eda_bioz_data = None
+            eda_bioz_summary = None
+    except Exception as e:
+        logger.warning(f"  Failed to load EDA/BioZ data: {str(e)}")
+        eda_bioz_data = None
+        eda_bioz_summary = None
     
     # Determine sampling frequency
     cfg_fs = cfg.get('signal', {}).get('sampling_frequency_hz', None)
@@ -322,7 +451,7 @@ def run_inspection_pipeline(config_path: str) -> None:
         logger.info(f"  Applied time offset: {time_offset_sec:.3f} sec")
     
     # ========================================================================
-    # STEP 4: Compute HR metrics from signal
+    # STEP 4: Compute HR metrics from signal if available
     # ========================================================================
     logger.info("\n[STEP 4] Computing HR metrics from signal...")
     
@@ -408,6 +537,82 @@ def run_inspection_pipeline(config_path: str) -> None:
         if activity_metrics.get('n_beats', 0) == 0:
             logger.warning(f"  Activity {idx}: No peaks detected in {signal_type.upper()} signal (signal_std={signal_std:.4f})")
         
+        # =============================
+        # Feature extraction for activity
+        # =============================
+        # Extract HRV features from RR intervals (if available from HR metrics extraction)
+        hrv_features = {}
+        rr_intervals_available = activity_metrics.get('rr_intervals_ms') is not None
+        if rr_intervals_available:
+            rr_intervals = np.array(activity_metrics['rr_intervals_ms'])
+            if isinstance(rr_intervals, list):
+                rr_intervals = np.array(rr_intervals)
+            if len(rr_intervals) >= 10:
+                activity_context = {'t_start': t_start, 't_end': t_end, 'duration_sec': activity['duration_sec']}
+                hrv_features = extract_activity_hrv_features(rr_intervals, activity_context, fs=fs)
+                if idx % 10 == 0:
+                    logger.debug(f"    Activity {idx}: Extracted {len(hrv_features)} HRV features from {len(rr_intervals)} RR intervals")
+            else:
+                logger.debug(f"    Activity {idx}: Insufficient RR intervals ({len(rr_intervals)} < 10) for HRV extraction")
+        else:
+            if idx % 10 == 0:
+                logger.debug(f"    Activity {idx}: No RR intervals in activity metrics (rr_intervals_ms=None)")
+        
+        # Extract EDA features if EDA/BioZ data available
+        eda_features = {}
+        if eda_bioz_data is not None and len(eda_bioz_data) > 0:
+            eda_signal, eda_time = extract_window_data(eda_bioz_data, t_start, t_end, signal_col='eda_bioz')
+            if len(eda_signal) >= 10:
+                eda_fs = estimate_sampling_frequency(eda_bioz_data['t_sec'].values)
+                activity_context = {'t_start': t_start, 't_end': t_end, 'duration_sec': activity['duration_sec']}
+                eda_features = extract_activity_eda_features(eda_signal, eda_time, activity_context, fs=eda_fs)
+                if idx % 10 == 0:
+                    logger.debug(f"    Activity {idx}: Extracted {len(eda_features)} EDA features from {len(eda_signal)} samples")
+            else:
+                if idx % 10 == 0:
+                    logger.debug(f"    Activity {idx}: Insufficient EDA samples ({len(eda_signal)} < 10) for EDA extraction")
+        else:
+            if idx % 10 == 0:
+                logger.debug(f"    Activity {idx}: No EDA/BioZ data available for feature extraction")
+        
+        # Extract PPG features if signal is PPG (or from ECG if PPG data was loaded as fallback)
+        ppg_features = {}
+        if ecg_data is not None and len(ecg_data) > 0 and signal_source and 'ppg' in signal_source.lower():
+            # Extract PPG window from loaded signal
+            ppg_signal, ppg_time = extract_window_data(ecg_data, t_start, t_end, signal_col='value')
+            if len(ppg_signal) >= 10:
+                ppg_fs = estimate_sampling_frequency(ecg_data['t_sec'].values)
+                activity_context = {'t_start': t_start, 't_end': t_end, 'duration_sec': activity['duration_sec']}
+                ppg_features = extract_activity_ppg_features(ppg_signal, ppg_time, activity_context, fs=ppg_fs)
+                if idx % 10 == 0:
+                    logger.debug(f"    Activity {idx}: Extracted {len(ppg_features)} PPG features from {len(ppg_signal)} samples")
+            else:
+                if idx % 10 == 0:
+                    logger.debug(f"    Activity {idx}: Insufficient PPG samples ({len(ppg_signal)} < 10) for PPG extraction")
+        else:
+            if idx % 10 == 0 and signal_source and 'ppg' not in signal_source.lower():
+                logger.debug(f"    Activity {idx}: Signal is {signal_source}, not PPG - skipping PPG feature extraction")
+
+        # Extract IMU top features per sensor (magnitude channel only for runtime efficiency)
+        imu_features = {}
+        if imu_sensors:
+            for sensor_name, sensor_df in imu_sensors.items():
+                if sensor_df is None or len(sensor_df) == 0 or 'imu_magnitude' not in sensor_df.columns:
+                    continue
+                imu_signal, imu_time = extract_window_data(sensor_df, t_start, t_end, signal_col='imu_magnitude')
+                if len(imu_signal) < 64:
+                    continue
+                imu_fs = estimate_sampling_frequency(sensor_df['t_sec'].values)
+                activity_context = {'t_start': t_start, 't_end': t_end, 'duration_sec': activity['duration_sec']}
+                sensor_features = extract_activity_imu_features(
+                    imu_signal, imu_time, activity_context,
+                    sensor_name=sensor_name,
+                    fs=imu_fs,
+                )
+                imu_features.update(sensor_features)
+            if idx % 10 == 0:
+                logger.debug(f"    Activity {idx}: Extracted {len(imu_features)} IMU features across {len(imu_sensors)} sensor(s)")
+        
         # Store with activity info
         result = {
             'activity_idx': idx,
@@ -417,7 +622,23 @@ def run_inspection_pipeline(config_path: str) -> None:
             'duration_sec': activity['duration_sec'],
         }
         result.update(activity_metrics)
+        result.update(hrv_features)
+        result.update(eda_features)
+        result.update(ppg_features)
+        result.update(imu_features)
         propulsion_metrics.append(result)
+
+        if viz_enabled and 'propulsion' in viz_activities:
+            if viz_max_windows is None or viz_counts.get('propulsion', 0) < viz_max_windows:
+                window = {
+                    'activity': 'propulsion',
+                    'activity_idx': idx,
+                    't_start': t_start,
+                    't_end': t_end,
+                    'duration_sec': activity['duration_sec']
+                }
+                if _plot_overlay_window(window, ecg_data, viz_output_dir, subject_label, viz_margin_sec, fs, viz_relative_time):
+                    viz_counts['propulsion'] = viz_counts.get('propulsion', 0) + 1
         
         if (idx + 1) % 5 == 0:
             logger.info(f"  Processed {idx + 1} activities...")
@@ -489,6 +710,81 @@ def run_inspection_pipeline(config_path: str) -> None:
         if activity_metrics.get('n_beats', 0) == 0:
             logger.warning(f"  Resting {idx}: No peaks detected in {signal_type.upper()} signal (signal_std={signal_std:.4f})")
         
+        # Extract HRV features from RR intervals
+        hrv_features = {}
+        rr_intervals_available = activity_metrics.get('rr_intervals_ms') is not None
+        if rr_intervals_available:
+            rr_intervals = np.array(activity_metrics['rr_intervals_ms'])
+            if isinstance(rr_intervals, list):
+                rr_intervals = np.array(rr_intervals)
+            if len(rr_intervals) >= 10:
+                activity_context = {'t_start': t_start, 't_end': t_end, 'duration_sec': activity['duration_sec']}
+                hrv_features = extract_activity_hrv_features(rr_intervals, activity_context, fs=fs)
+                if idx % 10 == 0:
+                    logger.debug(f"    Activity {idx}: Extracted {len(hrv_features)} HRV features from {len(rr_intervals)} RR intervals")
+            else:
+                logger.debug(f"    Activity {idx}: Insufficient RR intervals ({len(rr_intervals)} < 10) for HRV extraction")
+        else:
+            if idx % 10 == 0:
+                logger.debug(f"    Activity {idx}: No RR intervals in activity metrics (rr_intervals_ms=None)")
+        
+        # Extract EDA features if EDA/BioZ data available
+        eda_features = {}
+        if eda_bioz_data is not None and len(eda_bioz_data) > 0:
+            eda_signal, eda_time = extract_window_data(eda_bioz_data, t_start, t_end, signal_col='eda_bioz')
+            if idx % 10 == 0 or idx == 0:
+                logger.debug(f"    Resting {idx}: t_start={t_start:.1f}, t_end={t_end:.1f}, eda_data_range=[{eda_bioz_data['t_sec'].min():.1f}, {eda_bioz_data['t_sec'].max():.1f}], eda_samples={len(eda_signal)}")
+            if len(eda_signal) >= 10:
+                eda_fs = estimate_sampling_frequency(eda_bioz_data['t_sec'].values)
+                activity_context = {'t_start': t_start, 't_end': t_end, 'duration_sec': activity['duration_sec']}
+                eda_features = extract_activity_eda_features(eda_signal, eda_time, activity_context, fs=eda_fs)
+                if idx % 10 == 0:
+                    logger.debug(f"    Resting {idx}: Extracted {len(eda_features)} EDA features from {len(eda_signal)} samples")
+            else:
+                if idx % 10 == 0 or idx == 0:
+                    logger.debug(f"    Resting {idx}: Insufficient EDA samples ({len(eda_signal)} < 10) for EDA extraction, activity duration={activity['duration_sec']:.1f}s")
+        else:
+            if idx % 10 == 0:
+                logger.debug(f"    Resting {idx}: No EDA/BioZ data available for feature extraction")
+        
+        # Extract PPG features if signal is PPG (or from ECG if PPG data was loaded as fallback)
+        ppg_features = {}
+        if ecg_data is not None and len(ecg_data) > 0 and signal_source and 'ppg' in signal_source.lower():
+            # Extract PPG window from loaded signal
+            ppg_signal, ppg_time = extract_window_data(ecg_data, t_start, t_end, signal_col='value')
+            if len(ppg_signal) >= 10:
+                ppg_fs = estimate_sampling_frequency(ecg_data['t_sec'].values)
+                activity_context = {'t_start': t_start, 't_end': t_end, 'duration_sec': activity['duration_sec']}
+                ppg_features = extract_activity_ppg_features(ppg_signal, ppg_time, activity_context, fs=ppg_fs)
+                if idx % 10 == 0:
+                    logger.debug(f"    Resting {idx}: Extracted {len(ppg_features)} PPG features from {len(ppg_signal)} samples")
+            else:
+                if idx % 10 == 0:
+                    logger.debug(f"    Resting {idx}: Insufficient PPG samples ({len(ppg_signal)} < 10) for PPG extraction")
+        else:
+            if idx % 10 == 0 and signal_source and 'ppg' not in signal_source.lower():
+                logger.debug(f"    Resting {idx}: Signal is {signal_source}, not PPG - skipping PPG feature extraction")
+
+        # Extract IMU top features per sensor (magnitude channel only for runtime efficiency)
+        imu_features = {}
+        if imu_sensors:
+            for sensor_name, sensor_df in imu_sensors.items():
+                if sensor_df is None or len(sensor_df) == 0 or 'imu_magnitude' not in sensor_df.columns:
+                    continue
+                imu_signal, imu_time = extract_window_data(sensor_df, t_start, t_end, signal_col='imu_magnitude')
+                if len(imu_signal) < 64:
+                    continue
+                imu_fs = estimate_sampling_frequency(sensor_df['t_sec'].values)
+                activity_context = {'t_start': t_start, 't_end': t_end, 'duration_sec': activity['duration_sec']}
+                sensor_features = extract_activity_imu_features(
+                    imu_signal, imu_time, activity_context,
+                    sensor_name=sensor_name,
+                    fs=imu_fs,
+                )
+                imu_features.update(sensor_features)
+            if idx % 10 == 0:
+                logger.debug(f"    Resting {idx}: Extracted {len(imu_features)} IMU features across {len(imu_sensors)} sensor(s)")
+        
         # Store with activity info
         result = {
             'resting_idx': idx,
@@ -498,7 +794,23 @@ def run_inspection_pipeline(config_path: str) -> None:
             'duration_sec': activity['duration_sec'],
         }
         result.update(activity_metrics)
+        result.update(hrv_features)
+        result.update(eda_features)
+        result.update(ppg_features)
+        result.update(imu_features)
         resting_metrics.append(result)
+
+        if viz_enabled and 'resting' in viz_activities:
+            if viz_max_windows is None or viz_counts.get('resting', 0) < viz_max_windows:
+                window = {
+                    'activity': 'resting',
+                    'activity_idx': idx,
+                    't_start': t_start,
+                    't_end': t_end,
+                    'duration_sec': activity['duration_sec']
+                }
+                if _plot_overlay_window(window, ecg_data, viz_output_dir, subject_label, viz_margin_sec, fs, viz_relative_time):
+                    viz_counts['resting'] = viz_counts.get('resting', 0) + 1
         
         if (idx + 1) % 5 == 0:
             logger.info(f"  Processed {idx + 1} resting activities...")
@@ -561,6 +873,79 @@ def run_inspection_pipeline(config_path: str) -> None:
                 fs=fs
             )
 
+            # Extract HRV features from RR intervals
+            hrv_features = {}
+            rr_intervals_available = metrics.get('rr_intervals_ms') is not None
+            if rr_intervals_available:
+                rr_intervals = np.array(metrics['rr_intervals_ms'])
+                if isinstance(rr_intervals, list):
+                    rr_intervals = np.array(rr_intervals)
+                if len(rr_intervals) >= 10:
+                    activity_context = {'t_start': t_start, 't_end': t_end, 'duration_sec': activity['duration_sec']}
+                    hrv_features = extract_activity_hrv_features(rr_intervals, activity_context, fs=fs)
+                    if activity_idx % 10 == 0:
+                        logger.debug(f"    Custom {name} {activity_idx}: Extracted {len(hrv_features)} HRV features from {len(rr_intervals)} RR intervals")
+                else:
+                    logger.debug(f"    Custom {name} {activity_idx}: Insufficient RR intervals ({len(rr_intervals)} < 10) for HRV extraction")
+            else:
+                if activity_idx % 10 == 0:
+                    logger.debug(f"    Custom {name} {activity_idx}: No RR intervals in activity metrics (rr_intervals_ms=None)")
+            
+            # Extract EDA features if EDA/BioZ data available
+            eda_features = {}
+            if eda_bioz_data is not None and len(eda_bioz_data) > 0:
+                eda_signal, eda_time = extract_window_data(eda_bioz_data, t_start, t_end, signal_col='eda_bioz')
+                if len(eda_signal) >= 10:
+                    eda_fs = estimate_sampling_frequency(eda_bioz_data['t_sec'].values)
+                    activity_context = {'t_start': t_start, 't_end': t_end, 'duration_sec': activity['duration_sec']}
+                    eda_features = extract_activity_eda_features(eda_signal, eda_time, activity_context, fs=eda_fs)
+                    if activity_idx % 10 == 0:
+                        logger.debug(f"    Custom {name} {activity_idx}: Extracted {len(eda_features)} EDA features from {len(eda_signal)} samples")
+                else:
+                    if activity_idx % 10 == 0:
+                        logger.debug(f"    Custom {name} {activity_idx}: Insufficient EDA samples ({len(eda_signal)} < 10) for EDA extraction")
+            else:
+                if activity_idx % 10 == 0:
+                    logger.debug(f"    Custom {name} {activity_idx}: No EDA/BioZ data available for feature extraction")
+
+            # Extract PPG features if signal is PPG (or from ECG if PPG data was loaded as fallback)
+            ppg_features = {}
+            if ecg_data is not None and len(ecg_data) > 0 and signal_source and 'ppg' in signal_source.lower():
+                # Extract PPG window from loaded signal
+                ppg_signal, ppg_time = extract_window_data(ecg_data, t_start, t_end, signal_col='value')
+                if len(ppg_signal) >= 10:
+                    ppg_fs = estimate_sampling_frequency(ecg_data['t_sec'].values)
+                    activity_context = {'t_start': t_start, 't_end': t_end, 'duration_sec': activity['duration_sec']}
+                    ppg_features = extract_activity_ppg_features(ppg_signal, ppg_time, activity_context, fs=ppg_fs)
+                    if activity_idx % 10 == 0:
+                        logger.debug(f"    Custom {name} {activity_idx}: Extracted {len(ppg_features)} PPG features from {len(ppg_signal)} samples")
+                else:
+                    if activity_idx % 10 == 0:
+                        logger.debug(f"    Custom {name} {activity_idx}: Insufficient PPG samples ({len(ppg_signal)} < 10) for PPG extraction")
+            else:
+                if activity_idx % 10 == 0 and signal_source and 'ppg' not in signal_source.lower():
+                    logger.debug(f"    Custom {name} {activity_idx}: Signal is {signal_source}, not PPG - skipping PPG feature extraction")
+
+            # Extract IMU top features per sensor (magnitude channel only for runtime efficiency)
+            imu_features = {}
+            if imu_sensors:
+                for sensor_name, sensor_df in imu_sensors.items():
+                    if sensor_df is None or len(sensor_df) == 0 or 'imu_magnitude' not in sensor_df.columns:
+                        continue
+                    imu_signal, imu_time = extract_window_data(sensor_df, t_start, t_end, signal_col='imu_magnitude')
+                    if len(imu_signal) < 64:
+                        continue
+                    imu_fs = estimate_sampling_frequency(sensor_df['t_sec'].values)
+                    activity_context = {'t_start': t_start, 't_end': t_end, 'duration_sec': activity['duration_sec']}
+                    sensor_features = extract_activity_imu_features(
+                        imu_signal, imu_time, activity_context,
+                        sensor_name=sensor_name,
+                        fs=imu_fs,
+                    )
+                    imu_features.update(sensor_features)
+                if activity_idx % 10 == 0:
+                    logger.debug(f"    Custom {name} {activity_idx}: Extracted {len(imu_features)} IMU features across {len(imu_sensors)} sensor(s)")
+
             result = {
                 'activity_idx': activity_idx,
                 'activity_name': activity.get('activity', str(name)),
@@ -569,7 +954,23 @@ def run_inspection_pipeline(config_path: str) -> None:
                 'duration_sec': activity['duration_sec'],
             }
             result.update(metrics)
+            result.update(hrv_features)
+            result.update(eda_features)
+            result.update(ppg_features)
+            result.update(imu_features)
             activity_metrics_list.append(result)
+
+            if viz_enabled and safe_name in viz_activities:
+                if viz_max_windows is None or viz_counts.get(safe_name, 0) < viz_max_windows:
+                    window = {
+                        'activity': safe_name,
+                        'activity_idx': activity_idx,
+                        't_start': t_start,
+                        't_end': t_end,
+                        'duration_sec': activity['duration_sec']
+                    }
+                    if _plot_overlay_window(window, ecg_data, viz_output_dir, subject_label, viz_margin_sec, fs, viz_relative_time):
+                        viz_counts[safe_name] = viz_counts.get(safe_name, 0) + 1
 
         metrics_df = pd.DataFrame(activity_metrics_list)
         if 'activity_idx' not in metrics_df.columns:
@@ -586,6 +987,33 @@ def run_inspection_pipeline(config_path: str) -> None:
             f"skipped outside range={skipped_custom['outside_range']}, "
             f"insufficient data={skipped_custom['insufficient_data']}"
         )
+    
+    # ========================================================================
+    # STEP 6C: Feature Extraction Summary
+    # ========================================================================
+    logger.info("\n[STEP 6C] Feature extraction summary...")
+    
+    # Count HRV features in propulsion metrics
+    propulsion_hrv_cols = [c for c in propulsion_metrics_df.columns if c.startswith('hrv_')]
+    propulsion_eda_cols = [c for c in propulsion_metrics_df.columns if c.startswith('eda_')]
+    propulsion_ppg_cols = [c for c in propulsion_metrics_df.columns if c.startswith('ppg_')]
+    propulsion_imu_cols = [c for c in propulsion_metrics_df.columns if c.startswith('imu_')]
+    logger.info(f"  Propulsion activities: {len(propulsion_hrv_cols)} HRV, {len(propulsion_eda_cols)} EDA, {len(propulsion_ppg_cols)} PPG, {len(propulsion_imu_cols)} IMU features")
+    
+    # Count features in resting metrics
+    resting_hrv_cols = [c for c in resting_metrics_df.columns if c.startswith('hrv_')]
+    resting_eda_cols = [c for c in resting_metrics_df.columns if c.startswith('eda_')]
+    resting_ppg_cols = [c for c in resting_metrics_df.columns if c.startswith('ppg_')]
+    resting_imu_cols = [c for c in resting_metrics_df.columns if c.startswith('imu_')]
+    logger.info(f"  Resting activities: {len(resting_hrv_cols)} HRV, {len(resting_eda_cols)} EDA, {len(resting_ppg_cols)} PPG, {len(resting_imu_cols)} IMU features")
+    
+    # Count features in custom metrics
+    for name, metrics_df in custom_metrics_dfs.items():
+        custom_hrv_cols = [c for c in metrics_df.columns if c.startswith('hrv_')]
+        custom_eda_cols = [c for c in metrics_df.columns if c.startswith('eda_')]
+        custom_ppg_cols = [c for c in metrics_df.columns if c.startswith('ppg_')]
+        custom_imu_cols = [c for c in metrics_df.columns if c.startswith('imu_')]
+        logger.info(f"  Custom activity '{name}': {len(custom_hrv_cols)} HRV, {len(custom_eda_cols)} EDA, {len(custom_ppg_cols)} PPG, {len(custom_imu_cols)} IMU features")
     
     # ========================================================================
     # STEP 7: Baseline-Activity Comparison
@@ -768,7 +1196,29 @@ def run_inspection_pipeline(config_path: str) -> None:
         'ecg_data_samples': len(ecg_data),
         'ecg_data_duration_sec': ecg_data['t_sec'].max() - ecg_data['t_sec'].min(),
         'ecg_estimated_fs_hz': fs,
+        'imu_sensors_loaded': len(imu_sensors),
+        'eda_bioz_loaded': eda_bioz_data is not None and len(eda_bioz_data) > 0,
     }
+
+    if len(imu_sensors) > 0:
+        for sensor_name, sensor_df in imu_sensors.items():
+            duration_sec = sensor_df['t_sec'].max() - sensor_df['t_sec'].min()
+            fs_estimate = estimate_sampling_frequency(sensor_df['t_sec'].values)
+            magnitude_mean = sensor_df['imu_magnitude'].mean()
+            magnitude_std = sensor_df['imu_magnitude'].std()
+            
+            summary[f'imu_{sensor_name}_samples'] = len(sensor_df)
+            summary[f'imu_{sensor_name}_duration_sec'] = duration_sec
+            summary[f'imu_{sensor_name}_fs_hz'] = fs_estimate
+            summary[f'imu_{sensor_name}_magnitude_mean'] = magnitude_mean
+            summary[f'imu_{sensor_name}_magnitude_std'] = magnitude_std
+
+    if eda_bioz_summary is not None:
+        summary['eda_bioz_samples'] = eda_bioz_summary.get('n_samples', 0)
+        summary['eda_bioz_duration_sec'] = eda_bioz_summary.get('duration_sec', np.nan)
+        summary['eda_bioz_estimated_fs_hz'] = eda_bioz_summary.get('estimated_fs_hz', np.nan)
+        summary['eda_bioz_mean'] = eda_bioz_summary.get('signal_mean', np.nan)
+        summary['eda_bioz_std'] = eda_bioz_summary.get('signal_std', np.nan)
     
     # Add propulsion metrics summary
     if len(propulsion_metrics_df) > 0:

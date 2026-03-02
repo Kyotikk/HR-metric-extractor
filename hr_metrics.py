@@ -36,7 +36,7 @@ def check_signal_quality(signal: np.ndarray) -> dict:
     # Signal is flat if std is very small
     is_flat = signal_std < 1e-6
     
-    # Quality score based on signal variance (simplified), maybe arbitrary
+    # Quality score based on signal variance (simplified), maybe arbitrary, use NK score instead?
     # Typical ECG/PPG signals have std in reasonable range
     quality_score = min(1.0, signal_std / 5.0) if signal_std > 0 else 0
     
@@ -461,6 +461,7 @@ def extract_hr_metrics_from_timeseries(signal, time=None, signal_type: str = 'ec
 
         metrics = compute_hr_metrics_for_window(rr_intervals)
         metrics['n_peaks'] = len(peaks)
+        metrics['rr_intervals_ms'] = rr_intervals.tolist() if len(rr_intervals) > 0 else []
         # Add NeuroKit HRV summary where possible (falls back to computed defaults)
         extra = compute_hrv_summary_with_neurokit(rr_intervals, peaks, fs=fs)
         metrics.update(extra)
