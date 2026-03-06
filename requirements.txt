@@ -5,3 +5,4 @@ scipy>=1.7.0
 matplotlib>=3.4.0
 neurokit2>=0.1.8
 tifex-py>=0.1.4
+torch>=2.2.0

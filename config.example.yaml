@@ -70,6 +70,18 @@ analysis:
   recovery_window_sec: 300.0
   baseline_window_sec: 120.0
 
+  # Optional: expand each activity bout into multiple aligned windows
+  # (useful for short bouts and delayed cardio response modeling)
+  windowing:
+    enabled: false
+    include_original_bout: true
+    immediate_window_sec: [10.0, 20.0]
+    cardio_delay_window_sec: 20.0
+    cardio_delay_starts_sec: [10.0, 20.0, 30.0, 40.0]
+    recovery_window_sec: 20.0
+    recovery_starts_sec: [0.0, 20.0]
+    min_window_duration_sec: 5.0
+
 visualization:
   # Generate HR overlay plots during the pipeline run
   enable_overlays: false

@@ -102,30 +102,38 @@ def check_subject_data(subject_id: str) -> dict:
             adl_time_min = None
             adl_time_max = None
 
-    # Check for ECG data - could be in root or in a date subfolder
+    # Check for ECG data - could be in root or in date subfolders
     if ecg_dir.exists():
-        # Try direct path first (simulated subjects)
-        direct_ecg = next(ecg_dir.glob('data_*.csv.gz'), None)
-        if direct_ecg is None:
-            direct_ecg = next(ecg_dir.glob('*.csv.gz'), None)
+        is_simulated = subject_id.startswith('sim_')
 
-        if direct_ecg is not None and direct_ecg.exists():
-            ecg_path = str(direct_ecg)
-            has_ecg = True
-        else:
-            # For real subjects, point to the ECG directory to load all files
-            has_any = False
-            for item in sorted(ecg_dir.glob('*/*.csv.gz')):
-                try:
-                    with gzip.open(item, 'rt', encoding='utf-8', errors='ignore') as f:
-                        first_line = f.readline()
-                        second_line = f.readline()
-                        if first_line and second_line:
-                            has_any = True
-                            break
-                except Exception:
-                    continue
-            if has_any:
+        # Collect candidates from both root and nested folders.
+        root_files = sorted(ecg_dir.glob('*.csv.gz'))
+        nested_files = sorted(ecg_dir.glob('*/*.csv.gz'))
+        all_candidates = root_files + nested_files
+
+        has_any = False
+        for item in all_candidates:
+            try:
+                with gzip.open(item, 'rt', encoding='utf-8', errors='ignore') as f:
+                    header = f.readline()
+                    first_data_line = f.readline()
+                    if header and first_data_line:
+                        has_any = True
+                        break
+            except Exception:
+                continue
+
+        if has_any:
+            if is_simulated:
+                # Simulated subjects are typically single-file recordings.
+                direct_ecg = next(ecg_dir.glob('data_*.csv.gz'), None)
+                if direct_ecg is None:
+                    direct_ecg = next(iter(root_files), None)
+                if direct_ecg is not None:
+                    ecg_path = str(direct_ecg)
+                    has_ecg = True
+            else:
+                # Real subjects may contain many chunks/files; let loader handle full directory.
                 ecg_path = str(ecg_dir)
                 has_ecg = True
     
@@ -279,7 +287,7 @@ def process_subject(subject_id: str, batch_output_dir: Path) -> dict:
             cwd=Path.cwd(),
             capture_output=True,
             text=True,
-            timeout=600  # 10 minute timeout
+            timeout=1200  # 20 minute timeout
         )
         
         if result.returncode == 0:
@@ -305,7 +313,7 @@ def process_subject(subject_id: str, batch_output_dir: Path) -> dict:
             }
     
     except subprocess.TimeoutExpired:
-        logger.error(f"  ✗ Pipeline timeout (5 minutes)")
+        logger.error(f"  ✗ Pipeline timeout (20 minutes)")
         return {
             'subject_id': subject_id,
             'status': 'TIMEOUT',

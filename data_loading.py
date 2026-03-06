@@ -597,52 +597,57 @@ def load_ppg_data(subject_path: Path, channel: str = 'green') -> Optional[pd.Dat
     if not ppg_dir.exists():
         return None
     
-    # Find CSV file in the directory
-    csv_files = list(ppg_dir.glob('*.csv.gz'))
+    # Find PPG files in the directory (support flat and nested layouts)
+    csv_files = sorted(list(ppg_dir.glob('*.csv.gz')) + list(ppg_dir.glob('**/*.csv.gz')))
+    # Deduplicate paths when recursive glob includes top-level files
+    csv_files = list(dict.fromkeys(csv_files))
     if not csv_files:
         return None
-    
-    try:
-        ppg_path = csv_files[0]
-        df = pd.read_csv(ppg_path, compression='gzip')
-        
-        # Normalize column names
-        df.columns = [c.strip().lower() for c in df.columns]
-        
-        # Find time and signal columns
-        time_col = None
-        signal_col = None
-        
-        for col in df.columns:
-            if col in ['t_sec', 'time', 'timestamp', 't']:
-                time_col = col
-            elif col in ['value', 'ppg', 'signal', 'data']:
-                signal_col = col
-        
-        # If we couldn't find standard column names, use the first two columns
-        if time_col is None or signal_col is None:
-            if len(df.columns) >= 2:
-                time_col = df.columns[0]
-                signal_col = df.columns[1]
-            else:
-                return None
-        
-        # Extract and rename columns
-        result = df[[time_col, signal_col]].copy()
-        result.columns = ['t_sec', 'ppg']
-        
-        # Convert to numeric and remove NaNs
-        result['t_sec'] = pd.to_numeric(result['t_sec'], errors='coerce')
-        result['ppg'] = pd.to_numeric(result['ppg'], errors='coerce')
-        result = result.dropna()
-        
-        # Sort by time
-        result = result.sort_values('t_sec').reset_index(drop=True)
-        
-        return result if len(result) > 0 else None
-        
-    except Exception as e:
+
+    frames = []
+    for ppg_path in csv_files:
+        try:
+            df = pd.read_csv(ppg_path, compression='gzip')
+
+            # Normalize column names
+            df.columns = [c.strip().lower() for c in df.columns]
+
+            # Find time and signal columns
+            time_col = None
+            signal_col = None
+
+            for col in df.columns:
+                if col in ['t_sec', 'time', 'timestamp', 't']:
+                    time_col = col
+                elif col in ['value', 'ppg', 'signal', 'data']:
+                    signal_col = col
+
+            # If we couldn't find standard column names, use first two columns
+            if time_col is None or signal_col is None:
+                if len(df.columns) >= 2:
+                    time_col = df.columns[0]
+                    signal_col = df.columns[1]
+                else:
+                    continue
+
+            result = df[[time_col, signal_col]].copy()
+            result.columns = ['t_sec', 'ppg']
+            result['t_sec'] = pd.to_numeric(result['t_sec'], errors='coerce')
+            result['ppg'] = pd.to_numeric(result['ppg'], errors='coerce')
+            result = result.dropna()
+
+            if len(result) > 0:
+                frames.append(result)
+
+        except Exception:
+            continue
+
+    if not frames:
         return None
+
+    result = pd.concat(frames, ignore_index=True)
+    result = result.sort_values('t_sec').reset_index(drop=True)
+    return result if len(result) > 0 else None
 
 
 def load_best_available_signal(subject_path: Path, sensor_priority: list = None) -> Tuple[Optional[pd.DataFrame], str]:
