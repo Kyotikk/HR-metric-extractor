@@ -1,5 +1,9 @@
 {
     "chat.tools.terminal.autoApprove": {
-        "C:/Users/Nicla/Documents/ETHZ/Lifelogging/Code/effort_estimator_venv/Scripts/python.exe": true
+        "C:/Users/Nicla/Documents/ETHZ/Lifelogging/Code/effort_estimator_venv/Scripts/python.exe": true,
+        "/^python ml_tune_hybrid\\.py --base-config experiment_config\\.example\\.yaml --study-name smoke_tune --trials 1 --epochs 1 --objective val_mae$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
     }
 }

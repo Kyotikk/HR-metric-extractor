@@ -78,6 +78,7 @@ class NormalizationStats:
 class HybridICFDataset(Dataset):
     def __init__(
         self,
+        sample_indices: np.ndarray,
         subject_ids: np.ndarray,
         hrv_features: np.ndarray,
         eda_features: np.ndarray,
@@ -85,6 +86,7 @@ class HybridICFDataset(Dataset):
         targets: np.ndarray,
         max_transformer_dim: int,
     ) -> None:
+        self.sample_indices = sample_indices.astype(int)
         self.subject_ids = subject_ids
         self.hrv_features = hrv_features.astype(np.float32)
         self.eda_features = eda_features.astype(np.float32)
@@ -115,6 +117,7 @@ class HybridICFDataset(Dataset):
         target = torch.from_numpy(self.targets[index])
 
         return {
+            "row_index": int(self.sample_indices[index]),
             "subject_id": self.subject_ids[index],
             "hrv": hrv_vector,
             "transformer_tokens": transformer_tokens,
@@ -322,6 +325,7 @@ class ICFHybridDataModule:
 
         for split_name, split_indices_array in self.indices.items():
             self.datasets[split_name] = HybridICFDataset(
+                sample_indices=split_indices_array,
                 subject_ids=subject_ids[split_indices_array],
                 hrv_features=hrv_values[split_indices_array],
                 eda_features=eda_values[split_indices_array],

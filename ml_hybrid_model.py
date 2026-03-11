@@ -255,11 +255,15 @@ class TheoryInformedICFLoss(nn.Module):
         self,
         pred_score: torch.Tensor,
         clinical_target: torch.Tensor,
-        ca_value: torch.Tensor,
+        ca_value: torch.Tensor | None,
         icf_class_label: torch.Tensor,
+        use_ca_constraint: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         l_base = self.base_loss_fn(pred_score, clinical_target)
-        l_ca = F.mse_loss(pred_score, ca_value)
+        if use_ca_constraint and ca_value is not None:
+            l_ca = F.mse_loss(pred_score, ca_value)
+        else:
+            l_ca = torch.zeros((), device=pred_score.device, dtype=pred_score.dtype)
         l_ordinal = self._compute_ordinal_contrastive(pred_score, icf_class_label)
 
         total_loss = l_base + (self.alpha * l_ca) + (self.beta * l_ordinal)

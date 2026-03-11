@@ -87,6 +87,38 @@ def _total_overlap(activities: pd.DataFrame, segments, offset: float) -> float:
     return total
 
 
+def _offset_candidates_sec_from_hours(hours_cfg) -> List[float]:
+    """Build unique offset candidates in seconds from config hours.
+
+    Defaults are timezone-aligned hour offsets to avoid odd auto offsets.
+    """
+    default_hours = [-8.0, -7.0, 7.0, 8.0]
+
+    if hours_cfg is None:
+        hours = default_hours
+    elif isinstance(hours_cfg, (int, float, str)):
+        hours = [hours_cfg]
+    elif isinstance(hours_cfg, (list, tuple)):
+        hours = list(hours_cfg)
+    else:
+        logger.warning("Unsupported time_offset_candidates_hours type (%s); using defaults", type(hours_cfg).__name__)
+        hours = default_hours
+
+    parsed_hours = []
+    for value in hours:
+        try:
+            parsed_hours.append(float(value))
+        except Exception:
+            logger.warning("Ignoring invalid offset hour candidate: %r", value)
+
+    if not parsed_hours:
+        parsed_hours = default_hours
+
+    # Keep deterministic ordering and remove duplicates after rounding.
+    unique_hours = sorted({round(hour, 6) for hour in parsed_hours})
+    return [hour * 3600.0 for hour in unique_hours]
+
+
 def _resolve_subject_path_from_ecg_path(ecg_path_value: str) -> Path:
     """Resolve subject directory from an ECG config path (file or directory)."""
     ecg_cfg_path = Path(ecg_path_value)
@@ -466,6 +498,7 @@ def run_inspection_pipeline(config_path: str) -> None:
     # Preserve raw activity times for offset optimization
     propulsion_raw = propulsion.copy()
     resting_raw = resting.copy()
+    custom_raw = {name: df.copy() for name, df in custom_activities.items()}
     
     if time_offset_sec is None or time_offset_sec == 'auto':
         # Auto-estimate offset: align ADL activities to ECG segments based on ADL start time and ECG recording times
@@ -477,20 +510,53 @@ def run_inspection_pipeline(config_path: str) -> None:
             # Compute ECG segments to avoid aligning activities into gaps
             segments = _compute_ecg_segments(ecg_data['t_sec'].values)
 
-            # Candidate offsets: align ADL start to each segment start
-            candidate_offsets = [seg_start - adl_min for seg_start, _ in segments]
-            candidate_offsets.append(ecg_min - adl_min)
+            # Use timezone-aligned offset candidates (hours) to avoid odd offsets.
+            candidate_offsets = _offset_candidates_sec_from_hours(
+                cfg.get('activities', {}).get('time_offset_candidates_hours', None)
+            )
 
-            best_offset = ecg_min - adl_min
+            # If an explicit numeric offset is configured, prioritize it in candidate scoring.
+            if isinstance(time_offset_sec, (int, float)):
+                candidate_offsets = [float(time_offset_sec)] + candidate_offsets
+
+            # Deduplicate candidates while preserving order.
+            seen = set()
+            deduped_candidates = []
+            for off in candidate_offsets:
+                key = round(float(off), 6)
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped_candidates.append(float(off))
+            candidate_offsets = deduped_candidates
+
+            ecg_aligned_offset = ecg_min - adl_min
+            best_offset = candidate_offsets[0] if candidate_offsets else 0.0
             best_overlap = -1.0
+            candidate_scores = []
             for off in candidate_offsets:
                 overlap = _total_overlap(propulsion_raw, segments, off) + _total_overlap(resting_raw, segments, off)
+                for _, custom_df in custom_raw.items():
+                    overlap += _total_overlap(custom_df, segments, off)
+                candidate_scores.append((off, overlap))
                 if overlap > best_overlap:
                     best_overlap = overlap
                     best_offset = off
 
+            # If overlap ties or all overlaps are zero, choose candidate closest to raw alignment.
+            if len(candidate_scores) > 1:
+                max_overlap = max(score for _, score in candidate_scores)
+                tied = [off for off, score in candidate_scores if abs(score - max_overlap) < 1e-9]
+                if len(tied) > 1:
+                    best_offset = min(tied, key=lambda off: abs(off - ecg_aligned_offset))
+
             time_offset_sec = best_offset
-            logger.info(f"  Auto-estimated time offset: {time_offset_sec:.3f} sec ({time_offset_sec/3600:.1f} hours)")
+            logger.info("  Offset candidates (hours): %s", [round(off / 3600.0, 3) for off in candidate_offsets])
+            logger.info(
+                "  Candidate overlap scores: %s",
+                [f"{off/3600.0:.3f}h={score:.1f}s" for off, score in candidate_scores],
+            )
+            logger.info(f"  Auto-estimated time offset: {time_offset_sec:.3f} sec ({time_offset_sec/3600:.3f} hours)")
             logger.info(f"    (ADL start: {adl_min:.1f}, ECG range: {ecg_min:.1f} to {ecg_max:.1f})")
         else:
             time_offset_sec = 0.0

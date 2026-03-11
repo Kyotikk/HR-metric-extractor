@@ -2,10 +2,10 @@
   "target_col": "target_score",
   "subject_col": "subject_id",
   "split_mode": "subject",
-  "n_subjects": 19,
+  "n_subjects": 16,
   "splits": {
-    "train": 13,
-    "val": 3,
+    "train": 11,
+    "val": 2,
     "test": 3
   },
   "hrv_columns": [

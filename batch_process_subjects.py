@@ -23,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Data paths
-DATA_BASE_PATH = Path(r'D:\ETHZ\Lifelogging\interim_server')
+DATA_BASE_PATH = Path(r'C:\Users\Nicla\Documents\ETHZ\Lifelogging\Data\raw\LeoMed_download')
 SUBJECTS = [
     # 'sim_elderly_1', 'sim_elderly_2', 'sim_elderly_3', 'sim_elderly_4', 'sim_elderly_5',
     # 'sim_healthy_1', 'sim_healthy_2', 'sim_healthy_3', 'sim_healthy_4', 'sim_healthy_5',
@@ -172,6 +172,8 @@ def create_subject_config(subject_id: str, output_dir: Path, data_check: dict) -
         },
         'activities': {
             'time_offset_sec': None,  # Auto-estimate / kinda not working well
+            # Restrict auto-offset to timezone-aligned candidates (hours)
+            'time_offset_candidates_hours': [-8, -7, 7, 8],
             # d4500 Walking short distances
             'propulsion_keywords': ['level walking', 'walking', 'walker', 'self propulsion', 'propulsion', 'assisted propulsion'],
             # d4150 Maintaining a lying position

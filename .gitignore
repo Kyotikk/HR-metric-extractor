@@ -18,6 +18,12 @@ config.yaml
 # Outputs
 output/
 output_batch/
+output_ml/
+
+# Model checkpoints and artifacts
+*.pt
+*.pth
+.models/
 
 # Logs
 *.log
